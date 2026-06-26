@@ -18,12 +18,14 @@ from telegram import (
     InputMediaAnimation,
     Update,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ChosenInlineResultHandler,
     ContextTypes,
     InlineQueryHandler,
 )
+from telegram.helpers import escape_markdown
 
 # ─────────────────────────────────────────────────────────────────
 #  CONFIG
@@ -119,7 +121,7 @@ async def process_video(bot, ur_video: UserRequestVideo, inline_message_id: str)
     try:
         log.info(f"Downloading {ur_video.url}")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # download in thread pool so the event loop stays free
@@ -171,8 +173,8 @@ def download_video(ur_video: UserRequestVideo, tmpdir: str) -> str:
 
 
 async def send_final_message(bot, ur_video: UserRequestVideo, inline_message_id: str):
-    caption = (f'{ur_video.title[:200]}\n'
-               f'by {ur_video.author}\n'
+    caption = (f'{escape_markdown(ur_video.title[:200], version=2)}\n'
+               f'by {escape_markdown(ur_video.author, version=2)}\n'
                f'[(=^･ω･^=)]({ur_video.url})')
 
     await bot.edit_message_media(
@@ -180,7 +182,7 @@ async def send_final_message(bot, ur_video: UserRequestVideo, inline_message_id:
         media=InputMediaVideo(
             media=ur_video.file_id,
             caption=caption,
-            parse_mode="Markdown",
+            parse_mode=ParseMode.MARKDOWN_V2,
             supports_streaming=True,
         ),
         reply_markup=None,
@@ -203,7 +205,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ur_video = video_cache.get(url)
     if not ur_video:
         ur_video = UserRequestVideo(url)
-        await asyncio.get_event_loop().run_in_executor(executor, ur_video.fetch_info)
+        await asyncio.get_running_loop().run_in_executor(executor, ur_video.fetch_info)
 
     if ur_video.too_large:
         await update.inline_query.answer(
