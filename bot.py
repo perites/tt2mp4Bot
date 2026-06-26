@@ -61,27 +61,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────
-#  PROGRESS TRACKING
-# ─────────────────────────────────────────────────────────────────
-# @dataclass
-# class DownloadProgress:
-#     total_bytes: int = 0
-#     downloaded_bytes: int = 0
-#     speed: float = 0.0
-#     done: bool = False
-#
-#     @property
-#     def percent(self) -> int:
-#         if not self.total_bytes:
-#             return 0
-#         return min(int(self.downloaded_bytes / self.total_bytes * 100), 100)
-#
-#     @property
-#     def total_mb(self) -> str:
-#         return f"{self.total_bytes / 1024 / 1024:.1f} MB" if self.total_bytes else "? MB"
-
-
 @dataclass
 class UserRequestVideo:
     url: str
@@ -89,9 +68,10 @@ class UserRequestVideo:
     file_id: str = ''
     size_bytes: int = 0
     downloaded_bytes: int = 0
-    download_done: bool = 0
+    merging: bool = False
+    download_done: bool = False
     size_str: str = ''
-    too_large: bool = 1
+    too_large: bool = True
     title: str = ''
     author: str = ''
     thumbnail_url: str = ''
@@ -111,12 +91,21 @@ class UserRequestVideo:
             if d["status"] == "downloading":
                 self.downloaded_bytes = d.get("downloaded_bytes", 0)
             elif d["status"] == "finished":
+                self.merging = True  # download done, ffmpeg starting
+
+        return hook
+
+    def make_postprocessor_hook(self):  # ← new
+        def hook(d):
+            if d["status"] == "finished":
+                self.merging = False
                 self.download_done = True
 
         return hook
 
     def fetch_info(self):
         """Fetches metadata only — no download."""
+        log.info("FETCHING NEW INFO")
         opts = {
             "quiet": True,
             "no_warnings": True,
@@ -160,15 +149,17 @@ async def progress_updater(bot, inline_message_id: str, ur_video: UserRequestVid
     # await asyncio.sleep(1)  # give yt-dlp time to fetch headers + file size
 
     while not ur_video.download_done:
-        # try:
-        pct = ur_video.percent
-        bar = progress_bar(pct)
-        parts = [f"(ノ>ω<)ノ  {bar} {pct}%", ur_video.size_str]
+        if ur_video.merging:
+            label = f"(ノ>ω<)ノ merging video and audio"
+        else:
+            pct = ur_video.percent
+            bar = progress_bar(pct)
+            label = f"(ノ>ω<)ノ  {bar} {pct}% · {ur_video.size_str}"
 
         await bot.edit_message_reply_markup(
             inline_message_id=inline_message_id,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(" · ".join(parts), callback_data="noop")
+                InlineKeyboardButton(label, callback_data="noop")
             ]]),
         )
         # except asyncio.CancelledError:
@@ -204,6 +195,7 @@ def download_video(ur_video: UserRequestVideo, tmpdir: str) -> str:
         "no_warnings": True,
         "noplaylist": True,
         "progress_hooks": [ur_video.make_progress_hook()],
+        "postprocessor_hooks": [ur_video.make_postprocessor_hook()],
     }
 
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -241,8 +233,6 @@ async def process_video(bot, ur_video: UserRequestVideo, inline_message_id: str)
                 lambda: download_video(ur_video, tmpdir)
             )
 
-            update_task.cancel()
-
             with open(filepath, "rb") as f:
                 msg = await bot.send_video(
                     chat_id=CACHE_CHANNEL,
@@ -253,160 +243,30 @@ async def process_video(bot, ur_video: UserRequestVideo, inline_message_id: str)
                 )
                 ur_video.file_id = msg.video.file_id
 
-        caption = (f'{ur_video.title[:200]}\n'
-                   f'by {ur_video.author}\n'
-                   f'[(=^･ω･^=)]({ur_video.url})')
-
-        await bot.edit_message_media(
-            inline_message_id=inline_message_id,
-            media=InputMediaVideo(
-                media=ur_video.file_id,
-                caption=caption,
-                parse_mode="Markdown",
-                supports_streaming=True,
-            ),
-            reply_markup=None,
-        )
+            update_task.cancel()
 
         return ur_video
 
     except Exception as e:
         log.error("process_video error: %s", e, exc_info=True)
 
-        # # ── 1. Check cache ────────────────────────────────────────
-        # if url in video_cache:
-        #     log.info("Cache hit → %s", video_cache[url]["file_id"])
 
-        # else:
-        # ── 2. Download ───────────────────────────────────────
+async def send_final_message(bot, ur_video: UserRequestVideo, inline_message_id: str):
+    caption = (f'{ur_video.title[:200]}\n'
+               f'by {ur_video.author}\n'
+               f'[(=^･ω･^=)]({ur_video.url})')
 
-        # with tempfile.TemporaryDirectory() as tmpdir:
-        #     filepath, info = download_video(url, tmpdir)
-        #
-        #     if os.path.getsize(filepath) > MAX_BYTES:
-        #         await bot.edit_message_media(
-        #             inline_message_id=inline_message_id,
-        #             media=InputMedia(
-        #                 media_type="gif",
-        #                 media=PLACEHOLDER_FILE_ID,
-        #                 caption="❌ Video is too large for Telegram (> 50 MB)",
-        #             ),
-        #             reply_markup=None,
-        #         )
-        #         return
-        #
-        #     # ── 3. Upload to cache channel ────────────────────
-        #     with open(filepath, "rb") as f:
-        #         msg = await bot.send_video(
-        #             chat_id=CACHE_CHANNEL,
-        #             video=f,
-        #             supports_streaming=True,
-        #             read_timeout=180,
-        #             write_timeout=180,
-        #         )
-        #
-        # file_id = msg.video.file_id
-        # video_cache[url] = {
-        #     "file_id": file_id,
-        #     "author": info.get("uploader") or info.get("creator") or "creator",
-        #     "description": info.get("title") or "words",
-        # }
-        # log.info("Uploaded → file_id: %s", file_id)
+    await bot.edit_message_media(
+        inline_message_id=inline_message_id,
+        media=InputMediaVideo(
+            media=ur_video.file_id,
+            caption=caption,
+            parse_mode="Markdown",
+            supports_streaming=True,
+        ),
+        reply_markup=None,
+    )
 
-        # try:
-        #     with tempfile.TemporaryDirectory() as tmpdir:
-        #         # download in thread pool so the event loop stays free
-        #         filepath, info = await loop.run_in_executor(
-        #             executor,
-        #             lambda: download_video(url, tmpdir, progress),
-        #         )
-        #
-        #         progress.done = True
-        #         update_task.cancel()
-        #
-        #         title = info.get("title") or info.get("title") or "words"
-        #         author = info.get("uploader") or info.get("creator") or "creator"
-        #
-        #         # upload to cache channel → get permanent file_id
-        #         with open(filepath, "rb") as f:
-        #             msg = await bot.send_video(
-        #                 chat_id=CACHE_CHANNEL,
-        #                 video=f,
-        #                 supports_streaming=True,
-        #                 read_timeout=180,
-        #                 write_timeout=180,
-        #             )
-        #
-        # except Exception:
-        #     progress.done = True
-        #     update_task.cancel()
-        #     raise
-
-        # video_cache[url] = {
-        #     "file_id": msg.video.file_id,
-        #     "description": title,
-        #     "author": author,
-        # }
-        # log.info("Cached → %s", msg.video.file_id)
-
-        # cached = video_cache[url]
-        # file_id = cached["file_id"]
-        # author = cached["author"]
-        # description = cached["description"]
-
-        # ── 4. Swap placeholder → real video ──────────────────────
-
-    #     caption = ''
-    #     if description:
-    #         caption += f"{description[:200]}"  # trim long descriptions
-    #     if author:
-    #         caption += f"\nby {author}"
-    #     # caption += f'\n<a href = "{url}" >(=^･ω･^=)</a>'
-    #     caption += f'\n[(=^･ω･^=)]({url})'
-    #
-    #     await bot.edit_message_media(
-    #         inline_message_id=inline_message_id,
-    #         media=InputMediaVideo(
-    #             media=file_id,
-    #             caption=caption,  # ← add this
-    #             parse_mode="Markdown",
-    #             supports_streaming=True,
-    #         ),
-    #         reply_markup=None,
-    #     )
-    #
-    #     log.info("Message updated ✅")
-    #
-    # except Exception as e:
-    #     log.error("process_video error: %s", e, exc_info=True)
-
-
-# ─────────────────────────────────────────────────────────────────
-#  INLINE QUERY  — return placeholder instantly
-# ─────────────────────────────────────────────────────────────────
-# async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     query = update.inline_query.query.strip()
-#     match = URL_RE.search(query)
-#
-#     if not match:
-#         await update.inline_query.answer(
-#             [],
-#             cache_time=0,
-#         )
-#
-#     url = match.group(0)
-#     result_id = str(uuid4())
-#     pending[result_id] = url  # store so chosen_inline_result can find it
-#
-#     result = InlineQueryResultCachedGif(
-#         id=result_id,
-#         gif_file_id=PLACEHOLDER_FILE_ID,
-#         title="TikTok Video",
-#         reply_markup=LOADING_KEYBOARD,
-#     )
-#
-#     # cache_time=0 → fresh result every time
-#     await update.inline_query.answer([result], cache_time=0)
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query.query.strip()
@@ -419,8 +279,12 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    ur_video = UserRequestVideo(match.group(0))
-    ur_video.fetch_info()
+    url = match.group(0)
+
+    ur_video = video_cache.get(url)
+    if not ur_video:
+        ur_video = UserRequestVideo(url)
+        await asyncio.get_event_loop().run_in_executor(executor, ur_video.fetch_info)
 
     if ur_video.too_large:
         await update.inline_query.answer(
@@ -470,7 +334,10 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
         ]]),
     )
 
-    ur_video = await process_video(context.bot, ur_video, inline_message_id)
+    if not ur_video.file_id:
+        ur_video = await process_video(context.bot, ur_video, inline_message_id)
+
+    await send_final_message(context.bot, ur_video, inline_message_id)
     video_cache[ur_video.url] = ur_video
     # now start the background download
     # await asyncio.create_task()
