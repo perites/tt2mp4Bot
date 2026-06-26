@@ -175,7 +175,7 @@ def download_video(ur_video: UserRequestVideo, tmpdir: str) -> str:
 async def send_final_message(bot, ur_video: UserRequestVideo, inline_message_id: str):
     caption = (f'{escape_markdown(ur_video.title[:200], version=2)}\n'
                f'by {escape_markdown(ur_video.author, version=2)}\n'
-               f'[(=^･ω･^=)]({ur_video.url})')
+               f'[{escape_markdown('(=^･ω･^=)', version=2)}]({ur_video.url})')
 
     await bot.edit_message_media(
         inline_message_id=inline_message_id,
