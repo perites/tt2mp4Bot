@@ -44,16 +44,8 @@ URL_RE = re.compile(
 )
 MAX_BYTES = 50 * 1024 * 1024  # Telegram's 50 MB upload cap
 
-# Button shown while video is processing
-LOADING_KEYBOARD = InlineKeyboardMarkup([[
-    InlineKeyboardButton("⏳ Downloading video…", callback_data="noop")
-]])
-
 executor = ThreadPoolExecutor(max_workers=4)
 
-# ─────────────────────────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
@@ -67,9 +59,6 @@ class UserRequestVideo:
     _id: UUID = field(default_factory=uuid4)
     file_id: str = ''
     size_bytes: int = 0
-    downloaded_bytes: int = 0
-    merging: bool = False
-    download_done: bool = False
     size_str: str = ''
     too_large: bool = True
     title: str = ''
@@ -79,29 +68,6 @@ class UserRequestVideo:
     @property
     def id(self) -> str:
         return str(self._id)
-
-    @property
-    def percent(self) -> int:
-        if not self.size_bytes:
-            return 0
-        return min(int(self.downloaded_bytes / self.size_bytes * 100), 100)
-
-    def make_progress_hook(self):
-        def hook(d):
-            if d["status"] == "downloading":
-                self.downloaded_bytes = d.get("downloaded_bytes", 0)
-            elif d["status"] == "finished":
-                self.merging = True  # download done, ffmpeg starting
-
-        return hook
-
-    def make_postprocessor_hook(self):  # ← new
-        def hook(d):
-            if d["status"] == "finished":
-                self.merging = False
-                self.download_done = True
-
-        return hook
 
     def fetch_info(self):
         """Fetches metadata only — no download."""
@@ -139,92 +105,21 @@ class UserRequestVideo:
         return info.get("title") or "words"
 
 
-def progress_bar(percent: int, width: int = 10) -> str:
-    filled = int(percent / 100 * width)
-    return "█" * filled + " - " * (width - filled)
-
-
-async def progress_updater(bot, inline_message_id: str, ur_video: UserRequestVideo):
-    """Edits the button text every 4 seconds with live download stats."""
-    # await asyncio.sleep(1)  # give yt-dlp time to fetch headers + file size
-
-    while not ur_video.download_done:
-        if ur_video.merging:
-            label = f"(ノ>ω<)ノ merging video and audio"
-        else:
-            pct = ur_video.percent
-            bar = progress_bar(pct)
-            label = f"(ノ>ω<)ノ  {bar} {pct}% · {ur_video.size_str}"
-
-        await bot.edit_message_reply_markup(
-            inline_message_id=inline_message_id,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(label, callback_data="noop")
-            ]]),
-        )
-        # except asyncio.CancelledError:
-        #     break
-        # except Exception:
-        #     pass  # silently ignore edit failures (rate limit, etc.)
-
-        await asyncio.sleep(1)  # safe for Telegram's rate limit
-
-
 # ─────────────────────────────────────────────────────────────────
 #  STATE
 # ─────────────────────────────────────────────────────────────────
-# result_id  →  url  (set in inline_query, read in chosen_inline_result)
 pending: dict[str, UserRequestVideo] = {}
-
-# url  →  telegram file_id  (avoid re-downloading the same video)
 video_cache: dict[str, UserRequestVideo] = {}
 
 
 # ─────────────────────────────────────────────────────────────────
-#  DOWNLOAD
-# ─────────────────────────────────────────────────────────────────
-
-
-def download_video(ur_video: UserRequestVideo, tmpdir: str) -> str:
-    out_tmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
-    opts = {
-        "outtmpl": out_tmpl,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "progress_hooks": [ur_video.make_progress_hook()],
-        "postprocessor_hooks": [ur_video.make_postprocessor_hook()],
-    }
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-
-        info = ydl.extract_info(ur_video.url, download=True)
-        filepath = ydl.prepare_filename(info)
-
-    base, _ = os.path.splitext(filepath)
-    mp4 = base + ".mp4"
-    if not os.path.exists(mp4):
-        for f in os.listdir(tmpdir):
-            mp4 = os.path.join(tmpdir, f)
-            break
-
-    return mp4
-
-
-# ─────────────────────────────────────────────────────────────────
-#  BACKGROUND TASK — runs AFTER the placeholder is already in chat
+#  Video
 # ─────────────────────────────────────────────────────────────────
 async def process_video(bot, ur_video: UserRequestVideo, inline_message_id: str) -> UserRequestVideo:
     try:
         log.info(f"Downloading {ur_video.url}")
 
-        # progress = DownloadProgress()
         loop = asyncio.get_event_loop()
-        update_task = asyncio.create_task(
-            progress_updater(bot, inline_message_id, ur_video)
-        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # download in thread pool so the event loop stays free
@@ -243,12 +138,36 @@ async def process_video(bot, ur_video: UserRequestVideo, inline_message_id: str)
                 )
                 ur_video.file_id = msg.video.file_id
 
-            update_task.cancel()
-
         return ur_video
 
     except Exception as e:
         log.error("process_video error: %s", e, exc_info=True)
+
+
+def download_video(ur_video: UserRequestVideo, tmpdir: str) -> str:
+    out_tmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+    opts = {
+        "outtmpl": out_tmpl,
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+
+        info = ydl.extract_info(ur_video.url, download=True)
+        filepath = ydl.prepare_filename(info)
+
+    base, _ = os.path.splitext(filepath)
+    mp4 = base + ".mp4"
+    if not os.path.exists(mp4):
+        for f in os.listdir(tmpdir):
+            mp4 = os.path.join(tmpdir, f)
+            break
+
+    return mp4
 
 
 async def send_final_message(bot, ur_video: UserRequestVideo, inline_message_id: str):
@@ -306,16 +225,13 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thumbnail_url=ur_video.thumbnail_url,
         input_message_content=InputTextMessageContent(f"will download {ur_video.size_str}…"),
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("starting download…", callback_data="noop")
+            InlineKeyboardButton("(ノ>ω<)ノ starting download…", callback_data="noop")
         ]]),
     )
 
     await update.inline_query.answer([result], cache_time=0)
 
 
-# ─────────────────────────────────────────────────────────────────
-#  CHOSEN INLINE RESULT  — fires after user taps send
-# ─────────────────────────────────────────────────────────────────
 async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ur_video_id = update.chosen_inline_result.result_id
     inline_message_id = update.chosen_inline_result.inline_message_id
@@ -330,7 +246,7 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
             media=PLACEHOLDER_FILE_ID,
         ),
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("starting download…", callback_data="noop")
+            InlineKeyboardButton("(ノ>ω<)ノ  starting download…", callback_data="noop")
         ]]),
     )
 
@@ -339,8 +255,6 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await send_final_message(context.bot, ur_video, inline_message_id)
     video_cache[ur_video.url] = ur_video
-    # now start the background download
-    # await asyncio.create_task()
 
 
 # ─────────────────────────────────────────────────────────────────
