@@ -27,10 +27,14 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
+load_dotenv()
+
+from error_handler import error_handler
+
 # ─────────────────────────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────────────────────────
-load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CACHE_CHANNEL = os.getenv("CACHE_CHANNEL")
 PLACEHOLDER_FILE_ID = os.getenv('PLACEHOLDER_FILE_ID')
@@ -271,6 +275,7 @@ def main():
 
     app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(ChosenInlineResultHandler(chosen_inline_result))
+    app.add_error_handler(error_handler)
 
     print("Bot running!")
     app.run_polling(drop_pending_updates=True)
