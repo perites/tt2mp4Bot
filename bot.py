@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -75,6 +77,22 @@ class UserRequestVideo:
     def id(self) -> str:
         return str(self._id)
 
+    @property
+    def caption(self) -> str:
+        return (f'{escape_markdown(self.title[:200], version=2)}\n'
+                f'by {escape_markdown(self.author, version=2)}\n'
+                f'[{escape_markdown('(=^･ω･^=)', version=2)}]({self.url})')
+
+    @classmethod
+    async def find(cls, url) -> UserRequestVideo:
+        ur_video = video_cache.get(url)
+        if not ur_video:
+            ur_video = UserRequestVideo(url)
+            await asyncio.get_running_loop().run_in_executor(executor, ur_video.fetch_info)
+            video_cache[url] = ur_video
+
+        return ur_video
+
     def fetch_info(self):
         """Fetches metadata only — no download."""
         log.info("FETCHING NEW INFO")
@@ -110,87 +128,67 @@ class UserRequestVideo:
 
         return info.get("title") or "words"
 
+    # ─────────────────────────────────────────────────────────────────
+    #  Video
+    # ─────────────────────────────────────────────────────────────────
+    async def process_video(self, bot) -> None:
+        try:
+            log.info(f"Processing {self.url}")
+
+            loop = asyncio.get_running_loop()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # download in thread pool so the event loop stays free
+                filepath = await loop.run_in_executor(
+                    executor,
+                    lambda: self.download_video(self.url, tmpdir)
+                )
+
+                with open(filepath, "rb") as f:
+                    msg = await bot.send_video(
+                        chat_id=CACHE_CHANNEL,
+                        video=f,
+                        supports_streaming=True,
+                        read_timeout=180,
+                        write_timeout=180,
+                    )
+                    self.file_id = msg.video.file_id
+
+        except Exception as e:
+            log.error("process_video error: %s", e, exc_info=True)
+
+    @staticmethod
+    def download_video(url: str, tmpdir: str) -> str:
+        out_tmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+        opts = {
+            "outtmpl": out_tmpl,
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+
+        base, _ = os.path.splitext(filepath)
+        mp4 = base + ".mp4"
+        if not os.path.exists(mp4):
+            for f in os.listdir(tmpdir):
+                mp4 = os.path.join(tmpdir, f)
+                break
+
+        return mp4
+
 
 # ─────────────────────────────────────────────────────────────────
 #  STATE
 # ─────────────────────────────────────────────────────────────────
 pending: dict[str, UserRequestVideo] = {}
 video_cache: dict[str, UserRequestVideo] = {}
-
-
-# ─────────────────────────────────────────────────────────────────
-#  Video
-# ─────────────────────────────────────────────────────────────────
-async def process_video(bot, ur_video: UserRequestVideo, inline_message_id: str) -> UserRequestVideo:
-    try:
-        log.info(f"Downloading {ur_video.url}")
-
-        loop = asyncio.get_running_loop()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # download in thread pool so the event loop stays free
-            filepath = await loop.run_in_executor(
-                executor,
-                lambda: download_video(ur_video, tmpdir)
-            )
-
-            with open(filepath, "rb") as f:
-                msg = await bot.send_video(
-                    chat_id=CACHE_CHANNEL,
-                    video=f,
-                    supports_streaming=True,
-                    read_timeout=180,
-                    write_timeout=180,
-                )
-                ur_video.file_id = msg.video.file_id
-
-        return ur_video
-
-    except Exception as e:
-        log.error("process_video error: %s", e, exc_info=True)
-
-
-def download_video(ur_video: UserRequestVideo, tmpdir: str) -> str:
-    out_tmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
-    opts = {
-        "outtmpl": out_tmpl,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-    }
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-
-        info = ydl.extract_info(ur_video.url, download=True)
-        filepath = ydl.prepare_filename(info)
-
-    base, _ = os.path.splitext(filepath)
-    mp4 = base + ".mp4"
-    if not os.path.exists(mp4):
-        for f in os.listdir(tmpdir):
-            mp4 = os.path.join(tmpdir, f)
-            break
-
-    return mp4
-
-
-async def send_final_message(bot, ur_video: UserRequestVideo, inline_message_id: str):
-    caption = (f'{escape_markdown(ur_video.title[:200], version=2)}\n'
-               f'by {escape_markdown(ur_video.author, version=2)}\n'
-               f'[{escape_markdown('(=^･ω･^=)', version=2)}]({ur_video.url})')
-
-    await bot.edit_message_media(
-        inline_message_id=inline_message_id,
-        media=InputMediaVideo(
-            media=ur_video.file_id,
-            caption=caption,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            supports_streaming=True,
-        ),
-        reply_markup=None,
-    )
 
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,10 +204,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = match.group(0)
 
-    ur_video = video_cache.get(url)
-    if not ur_video:
-        ur_video = UserRequestVideo(url)
-        await asyncio.get_running_loop().run_in_executor(executor, ur_video.fetch_info)
+    ur_video = await UserRequestVideo.find(url)
 
     if ur_video.too_large:
         await update.inline_query.answer(
@@ -257,10 +252,73 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     if not ur_video.file_id:
-        ur_video = await process_video(context.bot, ur_video, inline_message_id)
+        await ur_video.process_video(context.bot)
 
-    await send_final_message(context.bot, ur_video, inline_message_id)
-    video_cache[ur_video.url] = ur_video
+    await context.bot.edit_message_media(
+        inline_message_id=inline_message_id,
+        media=InputMediaVideo(
+            media=ur_video.file_id,
+            caption=ur_video.caption,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            supports_streaming=True,
+        ),
+        reply_markup=None,
+    )
+
+
+# async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     text = update.message.text or ""
+#     match = URL_RE.search(text)
+#     if not match:
+#         return
+#
+#     url = match.group(0)
+#     status = await update.message.reply_text("⏳ Downloading…")
+#
+#     # check cache first
+#     if url in video_cache:
+#         ur_video = video_cache[url]
+#     else:
+#         ur_video = UserRequestVideo(url)
+#         await asyncio.get_running_loop().run_in_executor(executor, ur_video.fetch_info)
+#
+#         if ur_video.too_large:
+#             await status.edit_text(f"❌ Video too large — {ur_video.size_str} (limit 50 MB)")
+#             return
+#
+#         with tempfile.TemporaryDirectory() as tmpdir:
+#             await status.edit_text("⬇️ Downloading…")
+#             filepath = await asyncio.get_running_loop().run_in_executor(
+#                 executor,
+#                 lambda: download_video(ur_video, tmpdir),
+#             )
+#
+#             await status.edit_text("📤 Uploading…")
+#             with open(filepath, "rb") as f:
+#                 msg = await context.bot.send_video(
+#                     chat_id=CACHE_CHANNEL,
+#                     video=f,
+#                     supports_streaming=True,
+#                     read_timeout=180,
+#                     write_timeout=180,
+#                 )
+#             ur_video.file_id = msg.video.file_id
+#
+#         video_cache[url] = ur_video
+#
+#     caption = (
+#         f'{ur_video.title[:200]}\n'
+#         f'by {ur_video.author}\n'
+#         f'[(=^･ω･^=)]({ur_video.url})'
+#     )
+#
+#     await update.message.reply_video(
+#         video=ur_video.file_id,
+#         caption=caption,
+#         parse_mode="Markdown",
+#         supports_streaming=True,
+#     )
+#     await status.delete()
 
 
 # ─────────────────────────────────────────────────────────────────
