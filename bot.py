@@ -27,10 +27,10 @@ from telegram.ext import (
     ContextTypes,
     InlineQueryHandler,
 )
+from telegram.ext import MessageHandler, filters
 from telegram.helpers import escape_markdown
 
 load_dotenv()
-
 from error_handler import error_handler
 
 # ─────────────────────────────────────────────────────────────────
@@ -76,6 +76,29 @@ class UserRequestVideo:
     @property
     def id(self) -> str:
         return str(self._id)
+
+    def messages(self, name, category) -> str | InlineKeyboardMarkup:
+        messages = {
+            'download': '(ノ>ω<)ノ  starting download…',
+            'too_large': f'(×_×)  video too large - {self.size_str}'
+        }
+
+        match category:
+            case _ if category is str:
+                return messages[name]
+            case _ if category is InlineKeyboardMarkup:
+                return InlineKeyboardMarkup([[
+                    InlineKeyboardButton(messages[name], callback_data="noop", )
+                ]])
+
+    @property
+    def final_video(self) -> InputMediaVideo:
+        return InputMediaVideo(
+            media=self.file_id,
+            caption=self.caption,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            supports_streaming=True,
+        )
 
     @property
     def caption(self) -> str:
@@ -208,10 +231,10 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ur_video.too_large:
         await update.inline_query.answer(
-            [InlineQueryResultArticle(id='hint', title=f"(×_×)  video too large - {ur_video.size_str}",
+            [InlineQueryResultArticle(id='hint', title=f"{ur_video.messages('too_large', str)}",
                                       input_message_content=InputTextMessageContent(
-                                          f"(×_×)  video too large to download: <a href='{ur_video.url}'>link</a> ",
-                                          parse_mode='HTML'))],
+                                          f"{ur_video.messages('too_large', str)}: [link]({ur_video.url})",
+                                          parse_mode=ParseMode.MARKDOWN_V2))],
 
             cache_time=0,
         )
@@ -225,9 +248,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         description=f"by {ur_video.author}  •  size {ur_video.size_str}",
         thumbnail_url=ur_video.thumbnail_url,
         input_message_content=InputTextMessageContent(f"will download {ur_video.size_str}…"),
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("(ノ>ω<)ノ starting download…", callback_data="noop")
-        ]]),
+        reply_markup=ur_video.messages('download', InlineKeyboardMarkup),
     )
 
     await update.inline_query.answer([result], cache_time=0)
@@ -246,9 +267,7 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
         media=InputMediaAnimation(
             media=PLACEHOLDER_FILE_ID,
         ),
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("(ノ>ω<)ノ  starting download…", callback_data="noop")
-        ]]),
+        reply_markup=ur_video.messages('download', InlineKeyboardMarkup),
     )
 
     if not ur_video.file_id:
@@ -256,69 +275,36 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await context.bot.edit_message_media(
         inline_message_id=inline_message_id,
-        media=InputMediaVideo(
-            media=ur_video.file_id,
-            caption=ur_video.caption,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            supports_streaming=True,
-        ),
+        media=ur_video.final_video,
         reply_markup=None,
     )
 
 
-# async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     text = update.message.text or ""
-#     match = URL_RE.search(text)
-#     if not match:
-#         return
-#
-#     url = match.group(0)
-#     status = await update.message.reply_text("⏳ Downloading…")
-#
-#     # check cache first
-#     if url in video_cache:
-#         ur_video = video_cache[url]
-#     else:
-#         ur_video = UserRequestVideo(url)
-#         await asyncio.get_running_loop().run_in_executor(executor, ur_video.fetch_info)
-#
-#         if ur_video.too_large:
-#             await status.edit_text(f"❌ Video too large — {ur_video.size_str} (limit 50 MB)")
-#             return
-#
-#         with tempfile.TemporaryDirectory() as tmpdir:
-#             await status.edit_text("⬇️ Downloading…")
-#             filepath = await asyncio.get_running_loop().run_in_executor(
-#                 executor,
-#                 lambda: download_video(ur_video, tmpdir),
-#             )
-#
-#             await status.edit_text("📤 Uploading…")
-#             with open(filepath, "rb") as f:
-#                 msg = await context.bot.send_video(
-#                     chat_id=CACHE_CHANNEL,
-#                     video=f,
-#                     supports_streaming=True,
-#                     read_timeout=180,
-#                     write_timeout=180,
-#                 )
-#             ur_video.file_id = msg.video.file_id
-#
-#         video_cache[url] = ur_video
-#
-#     caption = (
-#         f'{ur_video.title[:200]}\n'
-#         f'by {ur_video.author}\n'
-#         f'[(=^･ω･^=)]({ur_video.url})'
-#     )
-#
-#     await update.message.reply_video(
-#         video=ur_video.file_id,
-#         caption=caption,
-#         parse_mode="Markdown",
-#         supports_streaming=True,
-#     )
-#     await status.delete()
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    match = URL_RE.search(text)
+    if not match:
+        return
+
+    url = match.group(0)
+    ur_video = await UserRequestVideo.find(url)
+
+    response = await update.message.reply_animation(
+        animation=PLACEHOLDER_FILE_ID,
+        reply_markup=ur_video.messages('download', InlineKeyboardMarkup)
+    )
+
+    if ur_video.too_large:
+        await response.edit_reply_markup(reply_markup=ur_video.messages('too_large', InlineKeyboardMarkup))
+        return
+
+    if not ur_video.file_id:
+        await ur_video.process_video(context.bot)
+
+    await response.edit_media(
+        media=ur_video.final_video,
+        reply_markup=None,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -333,6 +319,10 @@ def main():
 
     app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(ChosenInlineResultHandler(chosen_inline_result))
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
+        handle_group_message,
+    ))
     app.add_error_handler(error_handler)
 
     print("Bot running!")
