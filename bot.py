@@ -39,7 +39,7 @@ from error_handler import error_handler
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CACHE_CHANNEL = os.getenv("CACHE_CHANNEL")
-PLACEHOLDER_FILE_ID = os.getenv('PLACEHOLDER_FILE_ID')
+PLACEHOLDER_FILE_LINK = os.getenv('PLACEHOLDER_FILE_LINK')
 
 URL_RE = re.compile(
     r"https?://(?:"
@@ -265,7 +265,7 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
     await context.bot.edit_message_media(
         inline_message_id=inline_message_id,
         media=InputMediaAnimation(
-            media=PLACEHOLDER_FILE_ID,
+            media=PLACEHOLDER_FILE_LINK,
         ),
         reply_markup=ur_video.messages('download', InlineKeyboardMarkup),
     )
@@ -290,7 +290,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     ur_video = await UserRequestVideo.find(url)
 
     response = await update.message.reply_animation(
-        animation=PLACEHOLDER_FILE_ID,
+        animation=PLACEHOLDER_FILE_LINK,
         reply_markup=ur_video.messages('download', InlineKeyboardMarkup)
     )
 
